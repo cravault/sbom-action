@@ -1,0 +1,57 @@
+name: Cravault SBOM upload
+description: Generate a CycloneDX SBOM and upload it to Cravault for CRA / Article 14 monitoring.
+author: Cravault
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  token:
+    description: Cravault product ingest token (store as a repository secret).
+    required: true
+  version:
+    description: Release version the SBOM belongs to (e.g. a tag).
+    required: false
+    default: ${{ github.ref_name }}
+  path:
+    description: Directory to scan for dependencies.
+    required: false
+    default: .
+  api-url:
+    description: Cravault API base URL.
+    required: false
+    default: https://api.cravault.io
+  sbom-path:
+    description: Path to an existing CycloneDX SBOM. If set, generation is skipped.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Generate CycloneDX SBOM
+      if: ${{ inputs.sbom-path == '' }}
+      shell: bash
+      run: |
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b "$RUNNER_TEMP/bin"
+        "$RUNNER_TEMP/bin/syft" "${{ inputs.path }}" \
+          -o cyclonedx-json="$RUNNER_TEMP/sbom.cyclonedx.json"
+        echo "CRAVAULT_SBOM=$RUNNER_TEMP/sbom.cyclonedx.json" >> "$GITHUB_ENV"
+
+    - name: Use provided SBOM
+      if: ${{ inputs.sbom-path != '' }}
+      shell: bash
+      run: echo "CRAVAULT_SBOM=${{ inputs.sbom-path }}" >> "$GITHUB_ENV"
+
+    - name: Upload SBOM to Cravault
+      shell: bash
+      run: |
+        code=$(curl -sS -o /tmp/cravault-resp.json -w '%{http_code}' \
+          -X POST "${{ inputs.api-url }}/v1/sboms?version=${{ inputs.version }}" \
+          -H "Authorization: Bearer ${{ inputs.token }}" \
+          -F "file=@${CRAVAULT_SBOM};type=application/json")
+        echo "Cravault responded $code"
+        cat /tmp/cravault-resp.json
+        # 2xx = accepted; anything else fails the job.
+        [ "$code" -ge 200 ] && [ "$code" -lt 300 ]
