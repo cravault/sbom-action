@@ -37,12 +37,12 @@ runs:
           | sh -s -- -b "$RUNNER_TEMP/bin"
         "$RUNNER_TEMP/bin/syft" "${{ inputs.path }}" \
           -o cyclonedx-json="$RUNNER_TEMP/sbom.cyclonedx.json"
-        echo "CRAVAULT_SBOM=$RUNNER_TEMP/sbom.cyclonedx.json" >> "$GITHUB_ENV"
+        echo "CRAV_SBOM=$RUNNER_TEMP/sbom.cyclonedx.json" >> "$GITHUB_ENV"
 
     - name: Use provided SBOM
       if: ${{ inputs.sbom-path != '' }}
       shell: bash
-      run: echo "CRAVAULT_SBOM=${{ inputs.sbom-path }}" >> "$GITHUB_ENV"
+      run: echo "CRAV_SBOM=${{ inputs.sbom-path }}" >> "$GITHUB_ENV"
 
     - name: Upload SBOM to Cravault
       shell: bash
@@ -50,7 +50,7 @@ runs:
         code=$(curl -sS -o /tmp/cravault-resp.json -w '%{http_code}' \
           -X POST "${{ inputs.api-url }}/v1/sboms?version=${{ inputs.version }}" \
           -H "Authorization: Bearer ${{ inputs.token }}" \
-          -F "file=@${CRAVAULT_SBOM};type=application/json")
+          -F "file=@${CRAV_SBOM};type=application/json")
         echo "Cravault responded $code"
         cat /tmp/cravault-resp.json
         # 2xx = accepted; anything else fails the job.

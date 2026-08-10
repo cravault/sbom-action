@@ -22,12 +22,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: asinta/cravault-sbom-action@v1
         with:
-          token: ${{ secrets.CRAVAULT_TOKEN }}
+          token: ${{ secrets.CRAV_TOKEN }}
           version: ${{ github.ref_name }}
 ```
 
 Create a per-product ingest token in the Cravault app (Product → *Generate ingest token*)
-and store it as the `CRAVAULT_TOKEN` repository secret.
+and store it as the `CRAV_TOKEN` repository secret.
 
 ## Inputs
 
@@ -46,7 +46,7 @@ Point the action at it and skip generation:
 ```yaml
       - uses: asinta/cravault-sbom-action@v1
         with:
-          token: ${{ secrets.CRAVAULT_TOKEN }}
+          token: ${{ secrets.CRAV_TOKEN }}
           sbom-path: sbom.cyclonedx.json
 ```
 
