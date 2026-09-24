@@ -1,0 +1,61 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install pyyaml
+
+      # Runs the action's own steps against a stub Cravault. A composite action has no other
+      # test surface: without this, the first thing to execute it is somebody's release
+      # pipeline.
+      - name: Smoke test
+        run: python3 tests/test_action.py
+
+  # Proves the action works as a real workflow step, not only through the harness.
+  self:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stub Cravault on :8080
+        run: |
+          python3 - <<'PY' &
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  self.rfile.read(int(self.headers.get('content-length', 0)))
+                  body = b'{"id":"stub","component_count":0}'
+                  self.send_response(201)
+                  self.send_header('content-type', 'application/json')
+                  self.send_header('content-length', str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *a): pass
+          HTTPServer(('127.0.0.1', 8080), H).serve_forever()
+          PY
+          for _ in $(seq 20); do
+            curl -s -o /dev/null -X POST http://127.0.0.1:8080/ && break
+            sleep 0.5
+          done
+
+      - name: Generate and upload this repository's SBOM
+        uses: ./
+        with:
+          token: crv_ci_stub
+          version: ci-${{ github.run_id }}
+          api-url: http://127.0.0.1:8080

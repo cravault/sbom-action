@@ -18,40 +18,148 @@ inputs:
     required: false
     default: .
   api-url:
-    description: Cravault API base URL.
+    description: >-
+      Cravault API base URL, including the /api prefix the edge strips before proxying.
     required: false
-    default: https://api.cravault.io
+    default: https://cravault.io/api
   sbom-path:
     description: Path to an existing CycloneDX SBOM. If set, generation is skipped.
     required: false
     default: ""
+  kind:
+    description: >-
+      release for a shipped version, snapshot for a build between releases. Snapshots are
+      monitored the same way but are not treated as released artefacts.
+    required: false
+    default: release
+  syft-version:
+    description: >-
+      Tag of anchore/syft to install. Pinned rather than "latest": both the installer script
+      and the binary come from this tag, so a compromised or broken upstream release cannot
+      silently change what runs in your pipeline.
+    required: false
+    default: v1.52.0
+
+outputs:
+  sbom-path:
+    description: Path to the SBOM that was uploaded.
+    value: ${{ steps.resolve.outputs.sbom-path }}
 
 runs:
   using: composite
   steps:
+    # Inputs reach the shell through env, never through ${{ }} interpolation into the script
+    # body. GitHub substitutes ${{ }} into the script *text* before bash runs, so a value
+    # containing $(...) or backticks executes — and `version` defaults to github.ref_name,
+    # which anyone able to push a branch or tag controls. git happily accepts a ref named
+    # v1$(...). Through env the value is only ever data.
+    - name: Validate inputs
+      id: resolve
+      shell: bash
+      env:
+        API_URL: ${{ inputs.api-url }}
+        KIND: ${{ inputs.kind }}
+        SBOM_PATH: ${{ inputs.sbom-path }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        # A newline in any of these would let the value forge extra lines in $GITHUB_OUTPUT
+        # below (and in $GITHUB_ENV, which is why this action no longer writes there). None
+        # of them is legitimately multi-line, so reject rather than escape.
+        for name in API_URL KIND SBOM_PATH VERSION; do
+          case "${!name}" in
+            *$'\n'* | *$'\r'*)
+              echo "::error::input '$name' must not contain a line break" >&2
+              exit 1
+              ;;
+          esac
+        done
+
+        case "$KIND" in
+          release | snapshot) ;;
+          *)
+            echo "::error::kind must be 'release' or 'snapshot', got '$KIND'" >&2
+            exit 1
+            ;;
+        esac
+
+        if [ -z "$VERSION" ]; then
+          echo "::error::version is empty — pass it explicitly when the workflow is not tag-triggered" >&2
+          exit 1
+        fi
+
+        if [ -n "$SBOM_PATH" ]; then
+          if [ ! -f "$SBOM_PATH" ]; then
+            echo "::error::sbom-path '$SBOM_PATH' does not exist" >&2
+            exit 1
+          fi
+          echo "sbom-path=$SBOM_PATH" >> "$GITHUB_OUTPUT"
+        else
+          echo "sbom-path=$RUNNER_TEMP/sbom.cyclonedx.json" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Generate CycloneDX SBOM
       if: ${{ inputs.sbom-path == '' }}
       shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+        SBOM: ${{ steps.resolve.outputs.sbom-path }}
+        SYFT_VERSION: ${{ inputs.syft-version }}
       run: |
-        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-          | sh -s -- -b "$RUNNER_TEMP/bin"
-        "$RUNNER_TEMP/bin/syft" "${{ inputs.path }}" \
-          -o cyclonedx-json="$RUNNER_TEMP/sbom.cyclonedx.json"
-        echo "CRAV_SBOM=$RUNNER_TEMP/sbom.cyclonedx.json" >> "$GITHUB_ENV"
+        set -euo pipefail
 
-    - name: Use provided SBOM
-      if: ${{ inputs.sbom-path != '' }}
-      shell: bash
-      run: echo "CRAV_SBOM=${{ inputs.sbom-path }}" >> "$GITHUB_ENV"
+        # Installer and binary both come from the pinned tag. syft's own install.sh verifies
+        # the release checksums, so pinning the script is what closes the loop.
+        curl -sSfL "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh" \
+          | sh -s -- -b "$RUNNER_TEMP/bin" "$SYFT_VERSION"
+
+        "$RUNNER_TEMP/bin/syft" "$SCAN_PATH" -o "cyclonedx-json=$SBOM"
 
     - name: Upload SBOM to Cravault
       shell: bash
+      env:
+        API_URL: ${{ inputs.api-url }}
+        KIND: ${{ inputs.kind }}
+        SBOM: ${{ steps.resolve.outputs.sbom-path }}
+        TOKEN: ${{ inputs.token }}
+        VERSION: ${{ inputs.version }}
       run: |
-        code=$(curl -sS -o /tmp/cravault-resp.json -w '%{http_code}' \
-          -X POST "${{ inputs.api-url }}/v1/sboms?version=${{ inputs.version }}" \
-          -H "Authorization: Bearer ${{ inputs.token }}" \
-          -F "file=@${CRAV_SBOM};type=application/json")
+        set -euo pipefail
+
+        # Percent-encode for the query string. A plain "?version=$VERSION" mangles legitimate
+        # semver: '+' means space in a query, so the tag v1.0.0+build.5 arrived as
+        # "v1.0.0 build.5". Byte-wise, so multi-byte UTF-8 encodes correctly.
+        urlencode() {
+          local string="$1" out="" i char
+          local LC_ALL=C
+          for (( i = 0; i < ${#string}; i++ )); do
+            char="${string:i:1}"
+            case "$char" in
+              [a-zA-Z0-9.~_-]) out+="$char" ;;
+              # "'c" sign-extends bytes >= 0x80; mask back to a single byte.
+              *) out+=$(printf '%%%02X' "$(( $(printf '%d' "'$char") & 0xFF ))") ;;
+            esac
+          done
+          printf '%s' "$out"
+        }
+
+        response="$RUNNER_TEMP/cravault-response.json"
+        url="${API_URL%/}/v1/sboms?version=$(urlencode "$VERSION")&kind=$(urlencode "$KIND")"
+
+        # Retries so one blip or a 5xx doesn't fail a release pipeline. Ingest is idempotent
+        # by content hash, so a retried upload that did land is a no-op server-side.
+        code=$(curl -sS --retry 3 --retry-connrefused --retry-all-errors --max-time 120 \
+          -o "$response" -w '%{http_code}' \
+          -X POST "$url" \
+          -H "Authorization: Bearer $TOKEN" \
+          -F "file=@${SBOM};type=application/json")
+
         echo "Cravault responded $code"
-        cat /tmp/cravault-resp.json
-        # 2xx = accepted; anything else fails the job.
-        [ "$code" -ge 200 ] && [ "$code" -lt 300 ]
+        cat "$response" || true
+        echo
+
+        if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+          echo "::error::Cravault rejected the SBOM (HTTP $code)" >&2
+          exit 1
+        fi
